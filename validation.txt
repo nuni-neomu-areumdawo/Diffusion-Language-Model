@@ -1,0 +1,32 @@
+**Any text you wish!**
+
+<p align="center">
+:sparkles: 안녕하세요! (Hello!) :sparkles: ⸜(｡˃ ᵕ ˂ )⸝♡<br/>
+Welcome to my GitHub profile! <br/>
+I'm **@nuni-neomu-areumdawo**. <br/>
+It's nice to meet you! ( ´ ▽ ` )ﾉ <br/>
+</p>
+
+---
+
+:seedling: I'm a student currently interested in **Machine Learning** and **Data Science**! :seedling: <br/>
+:sparkling_heart: My goal is to explore and create **efficient** and **novel** solutions. Like Diffusion-LMs, joint embedding predictive architecture, etc. <br/>
+:brain: I'm learning! ✩•̩̩͙*˚ｄ(≧𓎟≦)ｂ˚*•̩̩͙✩ <br/>
+:revolving_hearts: I was born in South Korea and live in the United States of America.
+
+### :cherry_blossom: Some Projects I'm Working on! :cherry_blossom:
+
+Here are a few things I've been working on or find interesting:
+
+*   [**moe-counter**](https://github.com/nuni-neomu-areumdawo/moe-counter) :ribbon:: A counter script for Windows... for *research* and... *counting*!
+*   [**Online-IDE**](https://github.com/nuni-neomu-areumdawo/Online-IDE) :globe_with_meridians:: Write and run code right in your browser!
+*   [**Canvas-Scraper**](https://github.com/nuni-neomu-areumdawo/Canvas-Scraper) :books:: A simple tool to help gather info from public Canvas courses for educational purposes.
+*   [**(My Profile Config)**](https://github.com/nuni-neomu-areumdawo/nuni-neomu-areumdawo) :gear:: This!
+
+*(I have some other projects going privately... usually things I haven't bothered to polish. If you're interested in helping some involve Diffusion-LMs, web-scraping, multi-modal ML, data-analysis and some more fun stuff!)*
+
+---
+
+<p align="center">
+  Thanks for stopping by my profile! Feel free to look around~<br/>
+</p>
