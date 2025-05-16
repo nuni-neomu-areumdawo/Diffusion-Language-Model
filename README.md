@@ -88,24 +88,24 @@ Currently, inference is primarily demonstrated within the validation loop of the
 *   **Bidirectional Attention:** Consistent with LLaDA's design for a non-autoregressive diffusion model, the attention mechanism is bidirectional (causal masking is not strictly enforced).
 *   **Inference Prompt/Response Lengths:** During validation, prompts are generally longer than the generated response length. The `CONFIG.inference_steps` (e.g., 64) provides a good balance for generation quality in tests.
 
-## 📂 File Structure
+## File Structure
 
 ```
 .
-├── main.py         # Main Python script with model, training, etc.
+├── main.py                     # Main Python script with model, training, etc.
 ├── train.txt                   # Training data file
 ├── validation.txt              # Validation data file
-└── runs/                         # Directory for TensorBoard logs
+└── runs/                       # Directory for TensorBoard logs (tensorboard --logdir=runs)
 ```
 
 ## Ideas
 
-*   **Tokenization** Change to something more robust as byte-level, while very simple has significant performance degradation.
-*   **Full MLA Implementation:** Fully integrate and test the more complex `MultiHeadLatentAttention`
+*   **Tokenization** Change to something more robust as byte-level, while very simple has significant performance degradation. 90%
+*   **Full MLA Implementation:** Fully integrate and test the more complex `MultiHeadLatentAttention` 75%
 *   **Hyperparameter Optimization:** Conduct systematic hyperparameter tuning.
-*   **Extensive Evaluation:** Implement more evaluation metrics beside validation loss.
-*   **Standalone Inference Script:** Create a dedicated script for inference with a trained model.
-*   **Dataset Handling:** More robust dataset handling, potentially streaming for very large datasets.
+*   **Extensive Evaluation:** Implement more evaluation metrics beside validation loss. 
+*   **Standalone Inference Script:** Create a dedicated script for inference with a trained model. 75%
+*   **Dataset Handling:** More robust dataset handling, potentially streaming for very large datasets. 100% ✅
 *   **Detailed Profiling:** Profile different components (attention, FFN, data loading) to identify bottlenecks.
 
 ## Acknowledgements & References
