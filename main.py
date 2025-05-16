@@ -1,6 +1,6 @@
 """
 Implementation of a LLaDA-inspired Masked Diffusion Model for Text
-using PURE BYTE-LEVEL TOKENIZATION and Mixed Precision Training (AMP).
+using PURE BYTE-LEVEL TOKENIZATION and Mixed Precision Training.
 """
 
 import torch
@@ -14,73 +14,75 @@ import random
 import math
 import time
 from tqdm import tqdm
-from contextlib import nullcontext, suppress
+from contextlib import nullcontext
 from typing import Optional, Tuple, Dict, List, Union
-from pathlib import Path 
+from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter #tensorboard --logdir=runs
+import mmap
+import os
 
 #For more predictable results.
 torch.manual_seed(0)
 random.seed(0)
 
-# --- Configuration ---
+#Change stuff here
 class CONFIG:
     """ Stores configuration parameters for the model, training, and data """
 
-    # --- MLA Test --- 
+    #MLA Test
     head_dim = 32
     v_head_dim = head_dim
     nope_head_dim = 32
     rope_head_dim = 64
 
     kv_lora_rank = 64
-    q_lora_rank = 3 * kv_lora_rank
+    q_lora_rank = 4 * kv_lora_rank
 
-    # --- Special Byte-Level Token IDs ---
+    #Special Byte-Level Token IDs
     PAD_ID: int = 256
     MASK_ID: int = 257
     UNK_ID: int = 258
     NUM_SPECIAL_TOKENS: int = 3
 
-    # --- Data Files & Dirs ---
-    train_data_file: str = "./train.txt"
+    #Data Files & Dirs
+    train_data_file: str = "./concat.txt"
     validation_data_file: str = "./validation.txt"
     checkpoint_dir: Path = Path("./llada_byte_checkpoints_amp_v4")
     final_model_dir: Path = Path("./llada_byte_model_final_amp_v4")
-    name = "Diffusion-LM" 
+    name = "Diffusion-LM"
 
     # --- Model Architecture ---
     vocab_size: int = 256 + NUM_SPECIAL_TOKENS
-    model_dim: int = 512 #Higher = better memorization (good range is 128-2048~)
-    num_layers: int = 8 #Higher = better logic but harder to train (good range is 4-32~)
+    model_dim: int = 768 #Higher = better memorization (good range is 128-2048~)
+    num_layers: int = 16 #Higher = better logic but harder to train (good range is 4-32~)
     num_heads: int = 16
-    kv_latent_dim: int = model_dim // 4 # Example: 1024 // 4 = 256
-    dropout = 0
+    kv_latent_dim: int = model_dim // 16 # Example: 1024 // 4 = 256
+    dropout = 0.25
 
     assert kv_latent_dim > 0 and kv_latent_dim <= model_dim, "kv_latent_dim must be positive and <= model_dim"
 
     ffn_dim_multiplier: Optional[float] = None
     multiple_of: int = 256 #Ensure it aligns with model_dim
-    norm_eps: float = 1e-5
+    norm_eps: float = 1e-6 #1e-5
     use_bias: bool = False # Bias in Attention/FFN layers
 
-    # --- RoPE Specific ---
+    #RoPE Specific
     rope_theta: float = 10000.0
     rope_max_length_buffer: int = 2048 # Max length for RoPE precomputation buffer - should be >= max(train_max_len, max_infer_len)
 
-    # --- Training ---
+    #Training
     max_length: int = 768 # Max length for *training* chunks (in bytes), this increases model requirements.
     batch_size: int = 8 #Lower if your computer suffers
-    learning_rate: float = 2e-4 
+    learning_rate: float = 2e-4
     num_epochs: int = 500 # Train for this many epochs
     logging_steps: int = 250 # Log loss every N steps
     predict_steps: int = 2500 # Run validation inference every N steps
     gradient_accumulation_steps: int = 2
     gradient_clip_val: float = 1.0 # Max norm for gradient clipping
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    num_workers: int = 4 # Set num_workers=0 to debug DataLoader issues causing None items in collate_fn
+    num_workers: int = 8 # Set num_workers=0 to debug DataLoader issues causing None items in collate_fn
 
-    # --- AMP (Mixed Precision) ---
+    #Mixed Precision
     use_amp: bool = torch.cuda.is_available()
 
     # Use bfloat16 if available, otherwise float16 for AMP
@@ -89,23 +91,30 @@ class CONFIG:
         else torch.float16
     )
 
-    # --- Diffusion ---
+    #Diffusion
     mask_token_id: int = MASK_ID
     pad_token_id: int = PAD_ID
-    min_mask_prob: float = 0.075 # Min 't' during training
+    min_mask_prob: float = 0.05 # Min 't' during training
     loss_t_clamp_min: float = 1e-6 # Min 't' for loss division
 
-    # --- Validation ---
-    inference_steps: int = 64 # Number of diffusion steps for validation samples
+    #Validation
+    inference_steps: int = 128 # Number of diffusion steps for validation samples
     num_validation_samples: int = 5 # Number of validation examples to genearte
-    
-    #  --- Random length ranges for validation inference ---
+
+    #Random length ranges for validation inference
+
     val_prompt_min_len: int = 256
     val_prompt_max_len: int = 768
     val_response_min_len: int = 128
     val_response_max_len: int = 256
 
     verbose_inference: bool = True # Show step-by-step denoising?
+    repetition_penalty_strength: float = 1.05  # Values > 1.0 penalize. 1.0 means no penalty. Tune this.
+    repetition_penalty_window: int = 8
+    
+    consecutive_repetition_threshold: int = 3 # e.g., "    " (4 spaces)
+    repetitive_remask_boost: float = 1.0032 # e.g., 10% boost
+    min_len_for_targeted_remask: int = 8
 
 
 # --- Tokenizer Info (Byte Handling) ---
@@ -117,81 +126,166 @@ if CONFIG.MASK_ID is None or CONFIG.PAD_ID is None:
     raise ValueError("Essential special tokens (MASK_ID, PAD_ID) are not defined.")
 
 
-# --- Data Loading ---
 class ByteLevelTextDataset(Dataset):
     """
-    Loads text data from a file as raw bytes, converts bytes to their integer
-    representations (0-255), and chunks these integers into fixed-length sequences.
+    Loads text data from a file as raw bytes using memory mapping for streaming,
+    converts bytes to their integer representations (0-255) on-the-fly,
+    and provides fixed-length sequences.
+    Handles multiprocessing by initializing mmap in each worker.
     """
     def __init__(
         self, file_path: Union[str, Path], max_length: int, file_desc: str = "Training"
     ):
         self.max_length = max_length
-        self.examples: List[List[int]] = []
         self.file_path = Path(file_path)
         self.file_desc = file_desc
-        print(f"Reading {self.file_desc} data as BYTES from '{self.file_path}'...")
+        print(f"Initializing {self.file_desc} dataset (streaming) from '{self.file_path}' (main process or worker init)...")
 
-        byte_sequence = self._read_bytes()
-        if not byte_sequence:
-            print(f"Warning: {self.file_desc} file '{self.file_path}' empty/unreadable.")
-            return
+        self.file = None
+        self.mmap_obj = None
+        self._length: int = 0
+        self.file_size: int = 0
 
-        self._process_bytes(byte_sequence)
-
-    def _read_bytes(self) -> bytes:
         try:
-            return self.file_path.read_bytes()
+            if not self.file_path.exists() or self.file_path.stat().st_size == 0:
+                if self.file_desc == "Training":
+                    print(f"Warning: {self.file_desc} file '{self.file_path}' empty or not found in __init__.")
+                    self._create_dummy_byte_file()
+                    if not self.file_path.exists() or self.file_path.stat().st_size == 0:
+                        print(f"Error: Dummy file creation failed or resulted in an empty file for {self.file_path}.")
+                        return
+                else:
+                    print(f"Warning: {self.file_desc} file '{self.file_path}' empty or not found. No examples will be loaded.")
+                    return
+
+            self.file_size = self.file_path.stat().st_size
+            if self.file_size == 0:
+                print(f"Warning: {self.file_desc} file '{self.file_path}' is empty. No sequences will be created.")
+                return
+            if self.file_size < self.max_length:
+                print(f"Warning: {self.file_desc} file '{self.file_path}' (size: {self.file_size}) "
+                    f"is smaller than max_length ({self.max_length}). No sequences will be created.")
+                return
+
+            self._length = self.file_size // self.max_length
+
+            if self._length == 0:
+                print(f"WARNING: No full sequences can be created for {self.file_desc}.\nContent length {self.file_size} < max_length {self.max_length}?")
+            else:
+                pass
         except FileNotFoundError:
-            print("FileNotFoundError")
-            if self.file_desc == "Training":
-                self._create_dummy_byte_file()
-                with suppress(FileNotFoundError):
-                    return self.file_path.read_bytes()
-            return b""
+            print(f"FileNotFoundError during __init__ for {self.file_path} (should have been caught or dummy created).")
         except Exception as e:
-            print(f"Error reading file '{self.file_path}': {e}")
-            return b""
+            print(f"Error during initial setup of dataset '{self.file_path}': {e}")
+            self._cleanup_resources()
 
     def _create_dummy_byte_file(self):
-        #Creates a dummy data file if the original is missing.
         print(f"Creating dummy byte data file: {self.file_path}")
         dummy_text = ("Dummy sentence for training.\nIncludes newlines.\n" * 20)
-        dummy_bytes = dummy_text.encode('utf-8', errors='replace')
+        dummy_bytes_segment = dummy_text.encode('utf-8', errors='replace')
+        if not dummy_bytes_segment:
+            print("Error: Dummy byte segment is empty.")
+            return
+        num_chunks_to_create = 5
+        required_bytes = self.max_length * num_chunks_to_create
+        repeats = (required_bytes // len(dummy_bytes_segment)) + 1
+        final_dummy_bytes = dummy_bytes_segment * repeats
         try:
-            self.file_path.write_bytes(dummy_bytes * 100)
+            self.file_path.write_bytes(final_dummy_bytes)
+            print(f"Dummy file created: '{self.file_path}' with approx {len(final_dummy_bytes)} bytes.")
         except IOError as e:
             print(f"Error creating dummy byte file '{self.file_path}': {e}")
 
-    def _process_bytes(self, byte_sequence: bytes):
-        #Converts byte sequence to integer list and chunks into examples.
-        all_byte_ids = list(byte_sequence)
-        print(f"Total bytes read in {self.file_desc}: {len(all_byte_ids)}")
-        print(f"Chunking {self.file_desc} data into sequences of length {self.max_length}...")
+    def _ensure_resources_open(self):
+        """Opens file and mmap object if they haven't been opened yet (e.g., in a new worker)."""
+        if self.mmap_obj is None:
+            try:
+                if not self.file_path.exists() or self.file_path.stat().st_size == 0:
+                    print(f"Error in worker: {self.file_desc} file '{self.file_path}' not found or empty when trying to mmap.")
+                    self._length = 0
+                    return False
 
-        self.examples = [
-            all_byte_ids[i : i + self.max_length]
-            for i in range(0, len(all_byte_ids) - self.max_length + 1, self.max_length)
-        ]
+                current_file_size = self.file_path.stat().st_size
+                if current_file_size < self.max_length:
+                    print(f"Error in worker: {self.file_desc} file '{self.file_path}' (size: {current_file_size}) "
+                        f"too small for max_length ({self.max_length}).")
+                    self._length = 0
+                    return False
 
-        if not self.examples:
-            print(f"WARNING: No sequences created for {self.file_desc}. "
-                f"Content length {len(all_byte_ids)} < max_length {self.max_length}?")
-        else:
-            print(f"Created {len(self.examples)} sequences for {self.file_desc}.")
+                self.file = open(self.file_path, "rb")
+                self.mmap_obj = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
+                
+                self.file_size = current_file_size
+                self._length = self.file_size // self.max_length
+
+                if self._length > 0:
+                    print(f"Process {os.getpid()}: Successfully mmapped {self.file_path}, length: {self._length}")
+                else:
+                    print(f"Process {os.getpid()}: Mmapped {self.file_path}, but no full sequences. File size: {self.file_size}, max_length: {self.max_length}")
+                    self._cleanup_resources() 
+                    return False
+                return True
+
+            except Exception as e:
+                print(f"Error opening/mmapping file '{self.file_path}' in process {os.getpid()}: {e}")
+                self._cleanup_resources()
+                self._length = 0
+                return False
+        return True
 
     def __len__(self) -> int:
-        #Returns the number of sequences.
-        return len(self.examples)
+        return self._length
 
     def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]:
-        #Returns the byte sequence (as tensor) at the index, or None if invalid.
-        if not 0 <= idx < len(self.examples):
-            # Handles potential issues with multiprocessing/DataLoader workers
-            print(f"Warning: Invalid index {idx} requested from {self.file_desc} dataset of size {len(self.examples)}")
+        if not self._ensure_resources_open() or self.mmap_obj is None:
             return None
-        return {"input_ids": torch.tensor(self.examples[idx], dtype=torch.long)}
 
+        if not (0 <= idx < self._length):
+            return None
+
+        offset = idx * self.max_length
+        try:
+            byte_chunk = self.mmap_obj[offset : offset + self.max_length]
+            byte_ids_list = list(byte_chunk)
+            return {"input_ids": torch.tensor(byte_ids_list, dtype=torch.long)}
+        except ValueError as ve: 
+            print(f"ValueError reading chunk at index {idx} from {self.file_desc} mmap (possibly closed or offset issue): {ve}, pid {os.getpid()}")
+            self._cleanup_resources() 
+            return None
+        except Exception as e:
+            print(f"Error reading chunk at index {idx} from {self.file_desc} mmap: {e}, pid {os.getpid()}")
+            return None
+
+    def _cleanup_resources(self):
+        # print(f"Process {os.getpid()}: Cleaning up resources for {self.file_path}")
+        if self.mmap_obj:
+            try:
+                self.mmap_obj.close()
+            except Exception as e:
+                print(f"Error closing mmap_obj for {self.file_path} in {os.getpid()}: {e}")
+            self.mmap_obj = None
+        if self.file:
+            try:
+                self.file.close()
+            except Exception as e:
+                print(f"Error closing file for {self.file_path} in {os.getpid()}: {e}")
+            self.file = None
+
+    def close(self):
+        self._cleanup_resources()
+
+    def __del__(self):
+        self._cleanup_resources()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['file'] = None
+        state['mmap_obj'] = None
+
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
 
 def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torch.Tensor]:
     """
@@ -201,11 +295,16 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
     valid_items = [item for item in batch if item is not None and 'input_ids' in item]
 
     if not valid_items:
-        print("Warning: Collate function received empty or all-None/invalid batch.")
-        return {"input_ids": torch.empty((0, 0), dtype=torch.long),
-                "attention_mask": torch.empty((0, 0), dtype=torch.long)}
+        #print("Warning: Collate function received empty or all-None/invalid batch.")
+        return {"input_ids": torch.empty((0, CONFIG.max_length if hasattr(CONFIG, 'max_length') else 0), dtype=torch.long), # Ensure shape if possible
+                "attention_mask": torch.empty((0, CONFIG.max_length if hasattr(CONFIG, 'max_length') else 0), dtype=torch.long)}
 
     input_ids = [item['input_ids'] for item in valid_items]
+
+    #if any(t.size(0) != CONFIG.max_length for t in input_ids):
+    #print(f"Warning: Inconsistent tensor lengths in collate_fn: {[t.size(0) for t in input_ids]}")
+
+
     padded_input_ids = torch.nn.utils.rnn.pad_sequence(
         input_ids, batch_first=True, padding_value=CONFIG.pad_token_id
     )
@@ -216,28 +315,36 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
 def load_validation_sequences(
     file_path: Union[str, Path], max_length: int, num_samples: int
 ) -> List[Dict[str, torch.Tensor]]:
-    #Loads the first `num_samples` valid byte sequences from the validation file.
-    print(f"--- Loading Validation Byte Sequences ({num_samples} samples) ---")
+    print(f"Loading Validation Byte Sequences ({num_samples} samples)")
     validation_sequences = []
+    val_dataset = None
     try:
         val_dataset = ByteLevelTextDataset(file_path, max_length, file_desc="Validation")
+        if len(val_dataset) == 0: # Check if dataset could be initialized properly
+            print("No validation sequences to load (num_samples or dataset length is 0).")
+            return []
+
         num_to_load = min(num_samples, len(val_dataset))
-        if num_to_load == 0: 
-            print("No validation sequences available.")
+        if num_to_load == 0:
+            print("No validation sequences to load (num_samples or dataset length is 0).")
             return []
 
         for i in range(num_to_load):
             sample = val_dataset[i]
-            if sample is None: continue
+            if sample is None:
+                print(f"Warning: Validation sample at index {i} is None.")
+                continue
             ids = sample['input_ids']
             mask = (ids != CONFIG.pad_token_id).long().unsqueeze(0)
             ids = ids.unsqueeze(0)
             validation_sequences.append({"input_ids": ids, "attention_mask": mask})
         print(f"Successfully loaded {len(validation_sequences)} validation byte sequences.")
-    except Exception as e: 
+    except Exception as e:
         print(f"Error loading validation sequences: {e}")
         validation_sequences = []
-
+    finally:
+        if val_dataset:
+            val_dataset.close() # Explicitly close the validation dataset's resources
     return validation_sequences
 
 
@@ -247,7 +354,7 @@ class RMSNorm(nn.Module):
     def __init__(self, d, p=-1., eps=1e-6, bias=False):
         """
         Root Mean Square Layer Normalization
-        
+
         :param d: model size
         :param p: partial RMSNorm, valid value [0, 1], default -1.0 (disabled)
         :param eps:  epsilon value, default 1e-8
@@ -303,7 +410,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
         theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
 
     Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.    
+        torch.Tensor: Precomputed frequency tensor with complex exponentials.
 
     Based on: https://github.com/meta-llama/llama/blob/main/llama/model.py
     """
@@ -317,7 +424,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Ten
 
     """
     def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    
+
     Reshape frequency tensor for broadcasting it with another tensor.
 
     This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
@@ -333,13 +440,13 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Ten
     Raises:
         AssertionError: If the frequency tensor doesn't match the expected shape.
         AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
-    
+
         ndim = x.ndim
         assert 0 <= 1 < ndim
         assert freqs_cis.shape == (x.shape[1], x.shape[-1])
         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
         return freqs_cis.view(*shape)
-    
+
     From: https://github.com/meta-llama/llama/blob/main/llama/model.py
     """
     ndim = x.ndim
@@ -357,7 +464,7 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
         xk: torch.Tensor,
         freqs_cis: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
+
         Apply rotary embeddings to input tensors using the given frequency tensor.
 
         This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
@@ -372,7 +479,7 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-            
+
             xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
             xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
             freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
@@ -384,7 +491,7 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     """
     xq_r = xq.float().reshape(*xq.shape[:-1], -1, 2)
     xk_r = xk.float().reshape(*xk.shape[:-1], -1, 2)
-    
+
     xq_c = torch.view_as_complex(xq_r)
     xk_c = torch.view_as_complex(xk_r)
 
@@ -393,16 +500,15 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 
     xq_out = torch.view_as_real(xq_c * freqs_cis_reshaped).flatten(3)
     xk_out = torch.view_as_real(xk_c * freqs_cis_reshaped).flatten(3)
-    
+
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-# --- MLA (NOT USED RIGHT NOW) ---
 class MultiHeadLatentAttention(nn.Module):
     """
-    Multi Head Latent Attention 
+    Multi Head Latent Attention
     paper: https://arxiv.org/pdf/2405.04434
-    
-    TLDR: 
+
+    TLDR:
     kv are low ranks, this verient of attention project q,k,v to low rank to save memory,
     replace linear with lora(ish) layers
 
@@ -410,187 +516,146 @@ class MultiHeadLatentAttention(nn.Module):
     """
     def __init__(self, config: CONFIG):
         super().__init__()
-        
-        
+
         assert config.v_head_dim is not None , f"v_head_dim is not defined {config.v_head_dim=}"
         assert config.q_lora_rank is not None , f"q_lora_rank is not defined {config.q_lora_rank=}"
         assert config.kv_lora_rank is not None , f"kv_lora_rank is not defined {config.kv_lora_rank=}"
         assert config.rope_head_dim is not None , f"rope_head_dim is not defined {config.rope_head_dim=}"
-        
+        assert config.nope_head_dim is not None, f"nope_head_dim is not defined {config.nope_head_dim=}"
+
+
         self.config = config
-        
+
         self.dim = config.model_dim
         self.num_heads = config.num_heads
         self.v_head_dim = config.v_head_dim
-        
-        self.nope_head_dim = config.nope_head_dim
+
+        self.nope_head_dim = config.nope_head_dim 
         self.rope_head_dim = config.rope_head_dim
-        
+
         self.q_lora_rank = config.q_lora_rank
         self.kv_lora_rank = config.kv_lora_rank
-        
-        self.dropout = config.dropout
-        
-        self.value_dim = self.num_heads * self.v_head_dim
-        
-        self.nope_dim = self.num_heads * self.nope_head_dim
-        self.rope_dim = self.num_heads * self.rope_head_dim  
-        
-        self.compress_q_linear = nn.Linear(self.dim, self.q_lora_rank, bias=self.config.use_bias) 
-        self.decompress_q_nope = nn.Linear(self.q_lora_rank, self.nope_dim, bias=self.config.use_bias)
-        self.decompress_q_rope = nn.Linear(self.q_lora_rank, self.rope_dim, bias=self.config.use_bias)
-        self.q_norm = RMSNorm(self.q_lora_rank)
-        
-        
-        self.compress_kv_linear = nn.Linear(self.dim, self.kv_lora_rank, bias=self.config.use_bias) 
-        self.decompress_k_nope = nn.Linear(self.kv_lora_rank, self.nope_dim, bias=self.config.use_bias)
-        self.decompress_v_linear = nn.Linear(self.kv_lora_rank, self.value_dim, bias=self.config.use_bias)
-        self.kv_norm = RMSNorm(self.kv_lora_rank)
-        
-        
-        self.k_rope_linear = nn.Linear(self.dim, self.rope_head_dim, bias=self.config.use_bias)
-        # self.rope_norm = RMSNorm(self.rope_dim) # not in deepseekv2
 
-        self.proj = nn.Linear(self.value_dim , self.dim, bias=self.config.use_bias)
-        self.res_dropout = nn.Dropout(p=config.dropout)
-        
-        
-    def forward(self, x: Tensor,mask: torch.Tensor, freqs_cis: Tensor):
+        self.dropout_p = config.dropout 
+
+        self.value_out_dim = self.num_heads * self.v_head_dim
+
+        self.nope_q_dim_total = self.num_heads * self.nope_head_dim
+        self.nope_k_dim_total = self.num_heads * self.nope_head_dim 
+
+        self.rope_q_dim_total = self.num_heads * self.rope_head_dim
+
+        self.compress_q_linear = nn.Linear(self.dim, self.q_lora_rank, bias=self.config.use_bias)
+        self.decompress_q_nope = nn.Linear(self.q_lora_rank, self.nope_q_dim_total, bias=self.config.use_bias)
+        self.decompress_q_rope = nn.Linear(self.q_lora_rank, self.rope_q_dim_total, bias=self.config.use_bias)
+        self.q_norm = RMSNorm(self.q_lora_rank) 
+
+        self.compress_kv_linear = nn.Linear(self.dim, self.kv_lora_rank, bias=self.config.use_bias)
+        self.decompress_k_nope = nn.Linear(self.kv_lora_rank, self.nope_k_dim_total, bias=self.config.use_bias)
+        self.decompress_v_linear = nn.Linear(self.kv_lora_rank, self.value_out_dim, bias=self.config.use_bias)
+        self.kv_norm = RMSNorm(self.kv_lora_rank) # Norm is applied to the compressed KV
+
+        # K_rope is projected from full dimension 'x' directly to rope_head_dim 
+        self.k_rope_linear = nn.Linear(self.dim, self.rope_head_dim, bias=self.config.use_bias)
+
+        self.proj = nn.Linear(self.value_out_dim, self.dim, bias=self.config.use_bias) 
+        if self.dropout_p > 0:
+            self.res_dropout = nn.Dropout(p=self.dropout_p)
+
+
+    def forward(self, x: Tensor, freqs_cis: Tensor, padding_mask: Optional[torch.Tensor]): 
         batch_size, seq_len, _ = x.shape
 
+        # Query processing
         compressed_q = self.compress_q_linear(x)
         norm_q = self.q_norm(compressed_q)
-        query_nope:Tensor = self.decompress_q_nope(norm_q)
-        query_rope:Tensor = self.decompress_q_rope(norm_q)
+        query_nope_flat = self.decompress_q_nope(norm_q) 
+        query_rope_flat = self.decompress_q_rope(norm_q)
 
+        # Key and Value processing
         compressed_kv = self.compress_kv_linear(x)
         norm_kv = self.kv_norm(compressed_kv)
-        key_nope: Tensor = self.decompress_k_nope(norm_kv)
-        value: Tensor = self.decompress_v_linear(norm_kv)
+        key_nope_flat = self.decompress_k_nope(norm_kv)
+        value_flat = self.decompress_v_linear(norm_kv)
+
+        # Key RoPE part processing (projected from original x)
+        key_rope_flat_single_head = self.k_rope_linear(x)
+
+        # Reshape for multi-head attention
+        query_nope = query_nope_flat.view(batch_size, seq_len, self.num_heads, self.nope_head_dim).transpose(1,2)
+        query_rope = query_rope_flat.view(batch_size, seq_len, self.num_heads, self.rope_head_dim).transpose(1,2)
+
+        # Key NoPE: (bs, num_heads, seq_len, nope_head_dim)
+        key_nope = key_nope_flat.view(batch_size, seq_len, self.num_heads, self.nope_head_dim).transpose(1,2)
+
+        key_rope_single_head_view = key_rope_flat_single_head.view(batch_size, seq_len, 1, self.rope_head_dim).transpose(1,2)
+
+        key_rope_to_embed = key_rope_single_head_view / self.num_heads 
         
-        key_rope:Tensor = self.k_rope_linear(x)
+        value = value_flat.view(batch_size, seq_len, self.num_heads, self.v_head_dim).transpose(1,2)
 
-        query_nope = query_nope.view(batch_size, seq_len, self.num_heads, self.nope_head_dim).transpose(1,2)
-        query_rope = query_rope.view(batch_size, seq_len, self.num_heads, self.rope_head_dim).transpose(1,2)
-        
-        key_rope = key_rope.view(batch_size, seq_len, 1, self.rope_head_dim).transpose(1,2)
-        key_nope = key_nope.view(batch_size, seq_len, self.num_heads, self.nope_head_dim).transpose(1,2)
-        
-        value = value.view(batch_size, seq_len, self.num_heads, self.v_head_dim).transpose(1,2)
-        
-        # *** the line that fixes MLA :) ***
-        key_rope = key_rope/self.num_heads 
+        current_freqs_cis = freqs_cis[:seq_len] 
 
-        q_rope,k_rope = apply_rotary_emb(query_rope, key_rope, freqs_cis)
-        
-        q_recombined = torch.empty((batch_size,self.num_heads,seq_len, self.rope_head_dim + self.nope_head_dim), device=x.device)
-        k_recombined = torch.empty((batch_size, self.num_heads, seq_len, self.rope_head_dim + self.nope_head_dim), device=x.device)
-        
-        q_recombined[:,:,:,:self.nope_head_dim] = query_nope
-        q_recombined[:,:,:,self.nope_head_dim:] = q_rope
-        
-        k_recombined[:,:,:,:self.nope_head_dim] = key_nope
-        k_recombined[:,:,:,self.nope_head_dim:] = k_rope
+        q_rope_embedded, k_rope_embedded = apply_rotary_emb(query_rope, key_rope_to_embed, current_freqs_cis)
 
-        output = F.scaled_dot_product_attention(q_recombined, k_recombined, value, is_causal=True, dropout_p=self.dropout)
+        if k_rope_embedded.shape[1] == 1 and self.num_heads > 1:
+            k_rope_embedded = k_rope_embedded.expand(-1, self.num_heads, -1, -1)
 
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.num_heads * self.v_head_dim)
-
-        output = self.proj(output)
-        output = self.res_dropout(output)
-        return output
-    
-class SimplifiedMLAttention(nn.Module):
-    """
-    Multi-Head Latent Attention (Simplified Version).
-    Uses low-rank factorization for K and V projections.
-    Applies existing RoPE implementation to decompressed Q and K.
-    Does NOT implement DeepSeek's full Decoupled RoPE.
-
-    https://github.com/joey00072/Multi-Head-Latent-Attention-MLA-/blob/master/mla.py
-    """
-    def __init__(self, config: CONFIG):
-        super().__init__()
-        self.n_heads = config.num_heads
-        self.head_dim = config.model_dim // config.num_heads
-        self.kv_latent_dim = config.kv_latent_dim 
-        assert self.head_dim * self.n_heads == config.model_dim, "model_dim must be divisible by num_heads"
-
-        self.wq = nn.Linear(config.model_dim, config.num_heads * self.head_dim, bias=config.use_bias)
-        
-        self.w_kv_compress = nn.Linear(config.model_dim, self.kv_latent_dim, bias=config.use_bias)
-
-        self.w_k_decompress = nn.Linear(self.kv_latent_dim, config.num_heads * self.head_dim, bias=config.use_bias)
-        self.w_v_decompress = nn.Linear(self.kv_latent_dim, config.num_heads * self.head_dim, bias=config.use_bias)
-
-        self.wo = nn.Linear(config.num_heads * self.head_dim, config.model_dim, bias=config.use_bias)
-
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        bsz, seqlen, _ = x.shape
-
-        xq = self.wq(x).view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
-
-        c_kv = self.w_kv_compress(x)
-
-        xk_full = self.w_k_decompress(c_kv)
-        xv_full = self.w_v_decompress(c_kv)
-
-        xk = xk_full.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
-        xv = xv_full.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
-
-        current_freqs_cis = freqs_cis[:seqlen] 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=current_freqs_cis[:, :self.head_dim//2])
+        combined_head_dim = self.nope_head_dim + self.rope_head_dim
+        q_recombined = torch.cat([query_nope, q_rope_embedded], dim=-1)
+        k_recombined = torch.cat([key_nope, k_rope_embedded], dim=-1)
 
         attn_mask_for_pytorch = None
-        if mask is not None:
-            assert mask.ndim == 2, f"Padding mask should have ndim=2, got {mask.ndim}"
-            attn_mask_for_pytorch = (1.0 - mask[:, None, None, :].float()) * torch.finfo(xq.dtype).min
+        if padding_mask is not None:
+            attn_mask_for_pytorch = (1.0 - padding_mask[:, None, None, :].float()) * torch.finfo(q_recombined.dtype).min
 
-        # 7. Scaled Dot-Product Attention (using RoPE'd Q/K and decompressed V)
-        attn_output = F.scaled_dot_product_attention(
-            xq, xk, xv,
-            attn_mask=attn_mask_for_pytorch,
-            is_causal=False # Keep bidirectional for LLaDA https://github.com/ML-GSAI/LLaDA/blob/main/GUIDELINES.md
+        output = F.scaled_dot_product_attention(
+            q_recombined, k_recombined, value,
+            attn_mask=attn_mask_for_pytorch, 
+            is_causal=False, # LLaDA is bidirectional
+            dropout_p=self.dropout_p if self.training else 0.0
         )
 
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(attn_output)
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.value_out_dim)
+
+        output = self.proj(output)
+        if self.dropout_p > 0:
+            output = self.res_dropout(output)
+        return output
 
 class FeedForward(nn.Module):
-    """Modified SwiGLU Feed-Forward Network. """
+    #Modified SwiGLU Feed-Forward Network.
     def __init__(self, dim: int, hidden_dim: Optional[int] = None, multiple_of: int = 256, use_bias: bool = False):
         super().__init__()
-        if hidden_dim is None: 
+        if hidden_dim is None:
             hidden_dim = int(2 * (4 * dim) / 3)
             hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-            
+
         self.w1 = nn.Linear(dim, hidden_dim, bias=use_bias)
         self.w2 = nn.Linear(hidden_dim, dim, bias=use_bias)
         self.w3 = nn.Linear(dim, hidden_dim, bias=use_bias)
 
-        #https://azizbelaweid.substack.com/p/what-is-swiglu-how-to-implement-it
-    def forward(self, x): 
-        return self.w2(F.mish(self.w1(x), inplace=True) * self.w3(x)) #Silu -> Mish. Slower but better/more consistent results. I suggest Mish.
-    
+    def forward(self, x):
+        return self.w2(F.mish(self.w1(x), inplace=True) * self.w3(x)) #Mish has better performance change to SiLU for loyalty
+
 class TransformerBlock(nn.Module):
-    """ Simple Transformer block: Attention and FFN with pre-normalization. """
+    #Transformer block: Attention and FFN with pre-normalization.
     def __init__(self, config: CONFIG):
         super().__init__()
 
-        self.attention = SimplifiedMLAttention(config)
+        self.attention = MultiHeadLatentAttention(config)
 
         self.feed_forward = FeedForward(dim=config.model_dim, multiple_of=config.multiple_of, use_bias=config.use_bias)
-        self.attention_norm = RMSNorm(config.model_dim, eps=config.norm_eps) 
-        self.ffn_norm = RMSNorm(config.model_dim, eps=config.norm_eps)      
+        self.attention_norm = RMSNorm(config.model_dim, eps=config.norm_eps)
+        self.ffn_norm = RMSNorm(config.model_dim, eps=config.norm_eps)
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+
         h = x + self.attention(self.attention_norm(x), freqs_cis, padding_mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
-        
-# --- Main Model ---
+
 class MaskPredictorLLaDA(nn.Module):
-    """ LLaDA-inspired Mask Predictor Model (Byte-Level Vocab). """
     def __init__(self, config: CONFIG):
         super().__init__()
         self.config = config
@@ -598,15 +663,32 @@ class MaskPredictorLLaDA(nn.Module):
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_layers)])
         self.norm = RMSNorm(config.model_dim, eps=config.norm_eps)
         self.output = nn.Linear(config.model_dim, config.vocab_size, bias=config.use_bias)
-        self.register_buffer("freqs_cis", precompute_freqs_cis(config.model_dim // config.num_heads, config.rope_max_length_buffer, theta=config.rope_theta), persistent=False)
+
+        self.register_buffer(
+            "freqs_cis",
+            precompute_freqs_cis(
+                dim=config.rope_head_dim, 
+                end=config.rope_max_length_buffer,
+                theta=config.rope_theta
+            ),
+            persistent=False
+        )
+
         self.apply(self._init_weights)
-        print(f"--- Byte-Level Model Initialized ---\nVocab Size: {config.vocab_size}\nLayers: {config.num_layers}, Dim: {config.model_dim}, Heads: {config.num_heads}\nParams: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}\nRoPE Buffer Length: {self.freqs_cis.shape[0]}\n------------------------------------")
+        print(f"--- Byte-Level Model Initialized (Using Full MLA) ---")
+        print(f"Vocab Size: {config.vocab_size}, Layers: {config.num_layers}, Dim: {config.model_dim}, Heads: {config.num_heads}")
+        print(f"MLA Config: RoPE Dim: {config.rope_head_dim}, NoPE Dim: {config.nope_head_dim}, V Dim: {config.v_head_dim}")
+        print(f"Params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
+        print(f"RoPE Buffer Length: {self.freqs_cis.shape[0]} for dim {config.rope_head_dim}")
+        print("------------------------------------")
 
     def _init_weights(self, module: nn.Module):
-        if isinstance(module, nn.Linear): 
+        if isinstance(module, nn.Linear):
             std_dev = 0.02 / math.sqrt(2 * self.config.num_layers)
             torch.nn.init.normal_(module.weight, mean=0.0, std=std_dev)
-        elif isinstance(module, nn.Embedding): 
+            #if module.bias is not None:
+            #torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, tokens: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -615,12 +697,16 @@ class MaskPredictorLLaDA(nn.Module):
 
         freqs_cis_buffer = self.freqs_cis
         if seq_len > freqs_cis_buffer.shape[0]:
-            print(f"Warn: Recomputing RoPE for seqlen {seq_len} > buffer {freqs_cis_buffer.shape[0]}")
-            current_freqs_cis = precompute_freqs_cis(self.config.model_dim // self.config.num_heads, seq_len, theta=self.config.rope_theta).to(h.device)
-        else: 
+            print(f"Warning: Sequence length {seq_len} exceeds RoPE precomputed buffer {freqs_cis_buffer.shape[0]}. Recomputing RoPE frequencies for dim {self.config.rope_head_dim}.")
+            current_freqs_cis = precompute_freqs_cis(
+                dim=self.config.rope_head_dim,
+                end=seq_len,
+                theta=self.config.rope_theta
+            ).to(h.device)
+        else:
             current_freqs_cis = freqs_cis_buffer[:seq_len]
 
-        for layer in self.layers: 
+        for layer in self.layers:
             h = layer(h, current_freqs_cis, attention_mask)
 
         h = self.norm(h)
@@ -630,93 +716,165 @@ class MaskPredictorLLaDA(nn.Module):
 
 # --- Diffusion Helper Functions ---
 def forward_masking(x0: torch.Tensor, t: torch.Tensor, mask_token_id: int, pad_token_id: int, vocab_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """ Applies random masking based on probability t. """
+    #Applies random masking based on probability t.
     device = x0.device
     bsz, seqlen = x0.shape
     is_pad = (x0 == pad_token_id)
-    t = t.view(bsz, 1).to(device)
+    t_expanded = t.view(bsz, 1).to(device)
     rand_probs = torch.rand(bsz, seqlen, device=device)
-    should_mask = (rand_probs < t) & (~is_pad)
+    should_mask = (rand_probs < t_expanded) & (~is_pad)
     xt = torch.where(should_mask, mask_token_id, x0)
-    
+
     return xt, should_mask
 
 def calculate_masked_diffusion_loss(model: nn.Module, x0: torch.Tensor, attention_mask: torch.Tensor, config: CONFIG) -> torch.Tensor:
-    """ Calculates the LLaDA diffusion loss (Eq 3). """
     batch_size, seq_len = x0.shape
     device = x0.device
-    
+
     t = torch.rand(batch_size, device=device) * (1.0 - config.min_mask_prob) + config.min_mask_prob
     xt, was_masked = forward_masking(x0, t, config.mask_token_id, config.pad_token_id, config.vocab_size)
+
     logits = model(xt, attention_mask=attention_mask) 
-    
-    loss_fct = nn.CrossEntropyLoss(reduction='none')
+
+    loss_fct = nn.CrossEntropyLoss(reduction='none') 
+
     token_losses = loss_fct(logits.view(-1, config.vocab_size), x0.view(-1)).view(batch_size, seq_len)
-    relevant_mask = was_masked & attention_mask.bool()
-    masked_token_losses = token_losses * relevant_mask.float()
+
+    relevant_loss_mask = was_masked & attention_mask.bool() 
+
+    masked_token_losses = token_losses * relevant_loss_mask.float()
     sequence_loss_sum = masked_token_losses.sum(dim=1)
+
     t_clamped = t.clamp(min=config.loss_t_clamp_min)
-    scaled_sequence_loss = sequence_loss_sum / t_clamped.squeeze(-1)
+    scaled_sequence_loss = sequence_loss_sum / t_clamped 
+
     batch_loss = scaled_sequence_loss.mean()
-    if not torch.isfinite(batch_loss): 
-        print(f"\nWARNING: Non-finite loss ({batch_loss.item()})")
-        return torch.tensor(0.0, device=device, requires_grad=True)
-    
+
+    if not torch.isfinite(batch_loss):
+        print(f"\nWARNING: Non-finite loss ({batch_loss.item()}). Details: "
+            # f"Seq Loss Sum: {sequence_loss_sum}, t_clamped: {t_clamped}, "
+            # f"Token losses min/max: {token_losses.min()}/{token_losses.max()}"
+            )
+        return torch.tensor(0.0, device=device, requires_grad=True) 
+
     return batch_loss
 
-
-# --- Diffusion Inference Function ---
+#Diffusion Inference Function
 @torch.no_grad()
 def run_conditional_diffusion_inference(
     model: nn.Module, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor,
     response_len: int, config: CONFIG, num_steps: int, verbose: bool = False
 ) -> str:
-    """ Performs iterative conditional diffusion sampling (Random Remasking - Algo 4). """
     model.eval()
     device = config.device
     prompt_ids = prompt_ids.to(device)
     prompt_mask = prompt_mask.to(device)
     prompt_len = prompt_ids.shape[1]
-    #total_len = prompt_len + response_len
 
     amp_context = torch.cuda.amp.autocast(enabled=config.use_amp, dtype=config.amp_dtype) if config.device == 'cuda' else nullcontext()
 
-    # --- Step 1: Initialization ---
     response_part_r1 = torch.full((1, response_len), config.mask_token_id, dtype=torch.long, device=device)
-    rt = torch.cat([prompt_ids, response_part_r1], dim=1)
+    rt = torch.cat([prompt_ids, response_part_r1], dim=1) # rt shape: (1, total_len)
     response_attn_mask = torch.ones_like(response_part_r1)
     combined_mask = torch.cat([prompt_mask, response_attn_mask], dim=1)
 
-    if verbose: print(f"   [Step 0] Initial Response (IDs): {rt[0, prompt_len:].tolist()}")
+    if verbose:
+        print(f"   [Step 0] Initial Response (IDs): {rt[0, prompt_len:].tolist()}")
 
-    # --- Step 2: Time Schedule ---
     timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
 
     for i in range(num_steps):
-        t_val = timesteps[i]
-        s_val = timesteps[i+1]
+        t_val = timesteps[i].item()
+        s_val = timesteps[i+1].item()
 
-        with amp_context: logits = model(rt, attention_mask=combined_mask)
-        pred_x0_all = torch.argmax(logits, dim=-1)
+        with amp_context:
+            logits = model(rt, attention_mask=combined_mask)
 
-        remask_prob = s_val / t_val if t_val > 0 else 0.0; rand_uniform = torch.rand_like(rt, dtype=torch.float32)
-
-        response_rt = rt[:, prompt_len:]
-        is_masked_in_response = (response_rt == config.mask_token_id)
-        pred_x0_response = pred_x0_all[:, prompt_len:]
+        #Apply General Repetition Penalty
+        if config.repetition_penalty_strength > 1.0 and logits.shape[0] == 1:
+            modified_logits = logits.clone()
+            for j in range(response_len): # Iterate over each position in the response part of the logits
+                current_pred_position_in_total = prompt_len + j
+                start_idx_penalty_window = 0
+                if config.repetition_penalty_window > 0:
+                    start_idx_penalty_window = max(0, current_pred_position_in_total - config.repetition_penalty_window)
+                
+                ids_to_penalize = set()
+                if current_pred_position_in_total > start_idx_penalty_window:
+                    context_slice = rt[0, start_idx_penalty_window:current_pred_position_in_total]
+                    for token_id_tensor in context_slice:
+                        token_id = token_id_tensor.item()
+                        if 0 <= token_id <= 255: # Only penalize actual byte tokens
+                            ids_to_penalize.add(token_id)
+                
+                if ids_to_penalize:
+                    for token_val_to_penalize in ids_to_penalize:
+                        logit_val = modified_logits[0, current_pred_position_in_total, token_val_to_penalize]
+                        if logit_val > 0:
+                            modified_logits[0, current_pred_position_in_total, token_val_to_penalize] /= config.repetition_penalty_strength
+                        else:
+                            modified_logits[0, current_pred_position_in_total, token_val_to_penalize] *= config.repetition_penalty_strength
+            logits = modified_logits
         
-        keep_mask_decision = (rand_uniform[:, prompt_len:] < remask_prob) & is_masked_in_response
-        rs_response = torch.where(is_masked_in_response, torch.where(keep_mask_decision, config.mask_token_id, pred_x0_response), response_rt)
-        rs = torch.cat([prompt_ids, rs_response], dim=1)
-        rt = rs
+        pred_x0_all = torch.argmax(logits, dim=-1) # Predicted x0 based on (potentially penalized) logits
 
-        if verbose: #and (i % max(1, num_steps // 10) == 0 or i == num_steps - 1) 
+        base_remask_prob_scalar = s_val / t_val if t_val > 0 else 0.0
+        current_response_part_rt = rt[0, prompt_len:]
+        
+        remask_probabilities = torch.full_like(current_response_part_rt, base_remask_prob_scalar, dtype=torch.float32)
+        
+        if response_len >= config.min_len_for_targeted_remask and config.consecutive_repetition_threshold > 1:
+            predicted_response_tokens = pred_x0_all[0, prompt_len:].tolist()
+            count = 0
+            last_token = -1
+            
+            for k in range(response_len):
+                current_token = predicted_response_tokens[k]
+                if 0 <= current_token <= 255:
+                    if current_token == last_token:
+                        count += 1
+                    else:
+                        if count >= config.consecutive_repetition_threshold:
+                            for l_idx in range(k - count, k):
+                                if current_response_part_rt[l_idx].item() == config.mask_token_id:
+                                    remask_probabilities[l_idx] = min(1.0, base_remask_prob_scalar * config.repetitive_remask_boost)
+                        count = 1
+                        last_token = current_token
+                else:
+                    if count >= config.consecutive_repetition_threshold:
+                        for l_idx in range(k - count, k):
+                            if current_response_part_rt[l_idx].item() == config.mask_token_id:
+                                remask_probabilities[l_idx] = min(1.0, base_remask_prob_scalar * config.repetitive_remask_boost)
+                    count = 0
+                    last_token = -1
+            
+            if count >= config.consecutive_repetition_threshold:
+                for l_idx in range(response_len - count, response_len):
+                    if current_response_part_rt[l_idx].item() == config.mask_token_id:
+                            remask_probabilities[l_idx] = min(1.0, base_remask_prob_scalar * config.repetitive_remask_boost)
+
+        rand_uniform_response = torch.rand((1, response_len), device=device, dtype=torch.float32)
+
+        response_rt_current = rt[:, prompt_len:]
+        pred_x0_response = pred_x0_all[:, prompt_len:]
+        is_masked_in_response = (response_rt_current == config.mask_token_id)
+        
+        keep_mask_decision = (rand_uniform_response < remask_probabilities) & is_masked_in_response
+                
+        rs_response = torch.where(
+            is_masked_in_response,
+            torch.where(keep_mask_decision, config.mask_token_id, pred_x0_response),
+            response_rt_current 
+        )
+        rt = torch.cat([prompt_ids, rs_response], dim=1)
+
+        if verbose:
             num_masks = (rt[0, prompt_len:] == config.mask_token_id).sum().item()
+            avg_remask_p_display = remask_probabilities.mean().item() if response_len > 0 else base_remask_prob_scalar
             intermediate_bytes = bytes([b for b in rt[0, prompt_len:].tolist() if 0 <= b <= 255])
             intermediate_text = intermediate_bytes.decode('utf-8', errors='replace')
-            print(f"   [Step {i+1:>{len(str(num_steps))}}/{num_steps}] Masks: {num_masks:<4} | Resp: {repr(intermediate_text[:80])}...")
+            print(f"   [Step {i+1:>{len(str(num_steps))}}/{num_steps}] avg_remask_p={avg_remask_p_display:.3f} Masks: {num_masks:<4} | Gen: {repr(intermediate_text[:100])}...")
 
-    # --- Step 4: Final Decode ---
     final_ids = rt
     generated_response_ids = final_ids[0, prompt_len:].tolist()
     valid_bytes = [byte_id for byte_id in generated_response_ids if 0 <= byte_id <= 255]
@@ -731,127 +889,132 @@ def run_conditional_diffusion_inference(
     model.train()
     return generated_text
 
-
 def main():
     """ Main function: setup, training epochs, validation, saving. """
     print(f"--- Starting Byte-Level Model Training with AMP ---")
     print(f"Device: {CONFIG.device}, AMP Enabled: {CONFIG.use_amp}, AMP dtype: {CONFIG.amp_dtype}")
-    overall_start_time = time.time() - 1744475000
+    print(f"Number of workers: {CONFIG.num_workers}")
+    overall_start_time = time.time()
 
     model = MaskPredictorLLaDA(CONFIG).to(CONFIG.device)
-    #optimizer = SophiaG(model.parameters(), lr=CONFIG.learning_rate, betas=(0.965, 0.99), rho = 0.01, weight_decay=1e-1)
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG.learning_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, 25000)
     scaler = GradScaler(enabled=CONFIG.use_amp)
 
-    start_epoch = 0 
+    start_epoch = 0
     global_step = 0
 
-    # --- Prepare Data ---
     train_dataset = ByteLevelTextDataset(CONFIG.train_data_file, CONFIG.max_length, file_desc="Training")
-    if not train_dataset.examples: 
-        print("No training data. Exiting.") 
-        return
+    if len(train_dataset) == 0:
+        print("No training data available (dataset length is 0 after init). Exiting.")
+        return 
     
+    use_persistent_workers = (CONFIG.num_workers > 0)
     train_dataloader = DataLoader(
         train_dataset, batch_size=CONFIG.batch_size, shuffle=True, collate_fn=collate_fn,
-        num_workers=CONFIG.num_workers, pin_memory=(CONFIG.device=='cuda'), persistent_workers=(CONFIG.num_workers > 0)
+        num_workers=CONFIG.num_workers,
+        pin_memory=(CONFIG.device=='cuda'),
+        persistent_workers=use_persistent_workers,
     )
+    print(f"Train DataLoader: persistent_workers={use_persistent_workers}")
+
+
     validation_sequences = load_validation_sequences(
         CONFIG.validation_data_file, CONFIG.max_length, CONFIG.num_validation_samples
     )
 
-    # --- Training Loop ---
     print(f"Starting/Resuming training from Epoch {start_epoch+1}, Global Step {global_step}...")
-    total_batches_in_dataset = len(train_dataloader)
-    if total_batches_in_dataset == 0: 
-        print("Training dataloader empty. Exiting.")
+    if len(train_dataloader) == 0 :
+        print("Training dataloader is empty. Exiting.")
         return
-    
+    total_batches_in_dataset = len(train_dataloader)
     print(f"Total batches/epoch: {total_batches_in_dataset}")
 
     model.train()
-    timestep = 0
+    timestep_tb = 0
     for epoch in range(start_epoch, CONFIG.num_epochs):
-        epoch_start_time = time.time() - 1744475000
+        epoch_start_time = time.time()
         epoch_loss_total = 0.0
-        optimizer.zero_grad(set_to_none=True) # Zero grads at epoch start
 
-        initial_pbar_step = global_step % total_batches_in_dataset
         pbar = tqdm(
-            enumerate(train_dataloader), total=total_batches_in_dataset,
-            desc=f"Epoch {epoch+1}/{CONFIG.num_epochs}", dynamic_ncols=True, initial=initial_pbar_step
+            train_dataloader,
+            total=total_batches_in_dataset,
+            desc=f"Epoch {epoch+1}/{CONFIG.num_epochs}",
+            dynamic_ncols=True,
         )
-        if initial_pbar_step > 0: pbar.update(0)
 
-        for batch_idx_in_epoch, batch in pbar:
-            # --- Skip processed batches if resuming ---
-            current_global_step_for_batch = epoch * total_batches_in_dataset + batch_idx_in_epoch
-            if current_global_step_for_batch < global_step: continue
-
+        for batch_idx_in_epoch, batch in enumerate(pbar):
             input_ids = batch['input_ids'].to(CONFIG.device, non_blocking=True)
             attention_mask = batch['attention_mask'].to(CONFIG.device, non_blocking=True)
-            if input_ids.numel() == 0:
-                print(f"Warning: Skipping empty batch at E{epoch+1}, B{batch_idx_in_epoch}, G{global_step}")
-                global_step += 1 
+
+            if input_ids.numel() == 0 or attention_mask.numel() == 0:
+                print(f"Warning: Skipping empty batch (numel is 0) at E{epoch+1}, B{batch_idx_in_epoch}, G{global_step}")
                 continue
 
-            # --- Determine Autocast Context ---
+
             amp_context = autocast(enabled=CONFIG.use_amp, dtype=CONFIG.amp_dtype) if CONFIG.device == 'cuda' else nullcontext()
 
-            # --- Forward, Loss, Backward with AMP ---
             with amp_context:
                 loss = calculate_masked_diffusion_loss(model, input_ids, attention_mask, CONFIG)
 
             if not torch.isfinite(loss):
-                print(f"\nWarn: Non-finite loss E{epoch+1}, B{batch_idx_in_epoch}, G{global_step}. Skip update.")
-                if (global_step + 1) % CONFIG.gradient_accumulation_steps == 0: 
+                print(f"\nWarning: Non-finite loss {loss.item()} encountered at E{epoch+1}, B{batch_idx_in_epoch}, G{global_step}. Skipping update for this batch.")
+                if (global_step + 1) % CONFIG.gradient_accumulation_steps == 0:
                     optimizer.zero_grad(set_to_none=True)
-
                 global_step += 1
                 continue
 
+            epoch_loss_total += loss.item() * CONFIG.gradient_accumulation_steps
+
             scaled_loss = scaler.scale(loss / CONFIG.gradient_accumulation_steps)
             scaled_loss.backward()
-            epoch_loss_total += loss.item() # Track original loss
 
-            timestep += 1
-            writer.add_scalar('Loss', loss, timestep)
-            writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], timestep)
 
-            # --- Optimizer Step ---
             if (global_step + 1) % CONFIG.gradient_accumulation_steps == 0:
+                writer.add_scalar('Loss/train_step', loss.item(), global_step) 
+                writer.add_scalar('LearningRate/step', optimizer.param_groups[0]['lr'], global_step)
+
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=CONFIG.gradient_clip_val)
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                pbar.set_postfix({"Loss": f"{loss.item():.4f}", "Scale": f"{scaler.get_scale():.1f}", "Step": global_step + 1})
-
+                optimizer.zero_grad(set_to_none=True) 
+                scheduler.step()
+                
+                pbar.set_postfix({
+                    "Loss": f"{loss.item():.4f}",
+                    "AvgLoss": f"{epoch_loss_total / ((batch_idx_in_epoch+1)*CONFIG.gradient_accumulation_steps):.4f}",
+                    "Scale": f"{scaler.get_scale():.1f}",
+                    "Step": global_step + 1
+                })
             global_step += 1
+            timestep_tb += 1
 
-            # --- Periodic Logging ---
-            if global_step > 0 and global_step % CONFIG.logging_steps == 0:
-                print(f"\nGlobal Step: {global_step}, Last Batch Loss: {loss.item():.4f}") # Simple log
+            if global_step > 0 and (global_step % (CONFIG.logging_steps * CONFIG.gradient_accumulation_steps) == 0):
+                avg_loss_so_far = epoch_loss_total / (batch_idx_in_epoch + 1) / CONFIG.gradient_accumulation_steps
+                print(f"\nGlobal Step: {global_step}, Avg Loss Last {CONFIG.logging_steps} steps (approx): {avg_loss_so_far:.4f}, Current LR: {optimizer.param_groups[0]['lr']:.2e}")
 
-            # --- Periodic Validation & Saving ---
-            if global_step > 0 and global_step % CONFIG.predict_steps == 0:
+
+            if global_step > 0 and (global_step % (CONFIG.predict_steps * CONFIG.gradient_accumulation_steps) == 0):
                 if validation_sequences:
-                    print("\n" + "="*20 + f" Validation @ GStep {global_step} " + "="*20)
+                    print("\n" + "="*20 + f" Validation at Global Step {global_step} " + "="*20)
+                    model.eval()
                     for i, val_seq_data in enumerate(validation_sequences):
                         full_ids = val_seq_data["input_ids"].to(CONFIG.device)
                         full_mask = val_seq_data["attention_mask"].to(CONFIG.device)
-                        seq_len = full_ids.shape[1]
+                        seq_len_val = full_ids.shape[1]
 
-                        min_prompt = min(CONFIG.val_prompt_min_len, seq_len - 1 if seq_len > 1 else 1)
-                        max_prompt = min(CONFIG.val_prompt_max_len, seq_len - 1 if seq_len > 1 else 1)
+                        min_prompt = min(CONFIG.val_prompt_min_len, seq_len_val - 1 if seq_len_val > 1 else 1)
+                        max_prompt = min(CONFIG.val_prompt_max_len, seq_len_val - 1 if seq_len_val > 1 else 1)
                         prompt_len = random.randint(min_prompt, max_prompt) if min_prompt < max_prompt else min_prompt
-
-                        max_possible_resp_len = CONFIG.rope_max_length_buffer - prompt_len # Limit by RoPE buffer
+                        
+                        max_possible_resp_len = CONFIG.rope_max_length_buffer - prompt_len
                         max_resp = min(CONFIG.val_response_max_len, max(1, max_possible_resp_len))
-                        min_resp = min(CONFIG.val_response_min_len, max(1, max_resp -1))
+                        min_resp = min(CONFIG.val_response_min_len, max(1, max_resp -1 if max_resp > 1 else 1) )
                         response_len_to_generate = random.randint(min_resp, max_resp) if min_resp < max_resp else min_resp
-                        if prompt_len <= 0 or response_len_to_generate <= 0: 
-                            print(f"Warn: Invalid random split val {i+1}. Skip.")
+
+                        if prompt_len <= 0 or response_len_to_generate <= 0:
+                            print(f"Warn: Invalid random split for validation sample {i+1} (prompt {prompt_len}, resp {response_len_to_generate}). Skipping.")
                             continue
 
                         prompt_ids_val = full_ids[:, :prompt_len]
@@ -860,29 +1023,33 @@ def main():
                         target_response_mask = full_mask[:, prompt_len:]
 
                         prompt_bytes = bytes([b for b in prompt_ids_val[0].tolist() if 0 <= b <= 255])
-                        target_bytes = bytes([b for b in target_response_ids[0, target_response_mask[0] == 1].tolist() if 0 <= b <= 255])
+                        target_bytes = bytes([b for b in target_response_ids[0, target_response_mask[0] == 1].tolist() if 0 <= b <= 255]) # Use mask for target
                         prompt_text_repr = repr(prompt_bytes.decode('utf-8', errors='replace'))
                         target_text_repr = repr(target_bytes.decode('utf-8', errors='replace'))
-                        
-                        is_verbose = CONFIG.verbose_inference
 
-                        print(f"\n--- Val Sample {i+1} (Prompt Len: {prompt_len}, Gen Len: {response_len_to_generate}) ---")
+                        is_verbose_val = CONFIG.verbose_inference 
+
+                        print(f"\n--- Val Sample {i+1}/{len(validation_sequences)} (Prompt Len: {prompt_len}, Gen Len: {response_len_to_generate}) ---")
                         print(f"Prompt: {prompt_text_repr}")
                         print(f"Target: {target_text_repr} (Original suffix for reference)")
 
-                        generated_text_raw = run_conditional_diffusion_inference(model, prompt_ids_val, prompt_mask_val, response_len_to_generate, CONFIG, CONFIG.inference_steps, verbose=is_verbose)
-                        generated_text_repr = repr(generated_text_raw) # Show raw output
+                        generated_text_raw = run_conditional_diffusion_inference(
+                            model, prompt_ids_val, prompt_mask_val, response_len_to_generate,
+                            CONFIG, CONFIG.inference_steps, verbose=is_verbose_val
+                        )
+                        generated_text_repr = repr(generated_text_raw)
 
                         print(f"Gen:    {generated_text_repr}")
-                        if is_verbose: print("-" * 15 + " End Verbose " + "-" * 15)
+                        if is_verbose_val:
+                            print("-" * 15 + " End Verbose " + "-" * 15)
                     print("="*60 + "\n")
-                    model.train() 
-                else: 
-                    print(f"\nStep {global_step}: No validation sequences loaded.")
+                    model.train()
+                else:
+                    print(f"\nStep {global_step}: No validation sequences loaded to run prediction.")
 
 
-        epoch_duration = time.time() - 1744475000 - epoch_start_time
-        avg_epoch_loss = epoch_loss_total / total_batches_in_dataset if total_batches_in_dataset > 0 else 0.0
+        epoch_duration = time.time() - epoch_start_time
+        avg_epoch_loss = epoch_loss_total / total_batches_in_dataset / CONFIG.gradient_accumulation_steps if total_batches_in_dataset > 0 else 0.0
         print(f"\n--- Epoch {epoch+1} Finished ---")
         print(f"Time Taken: {epoch_duration:.2f} seconds")
         print(f"Average Training Loss for Epoch: {avg_epoch_loss:.4f}")
@@ -890,22 +1057,35 @@ def main():
         print("---------------------------\n")
 
 
-    total_training_time = time.time() - 1744475000 - overall_start_time
+    total_training_time = time.time() - overall_start_time
     print("--- Training Finished ---")
     print(f"Total Training Time: {total_training_time:.2f} seconds ({total_training_time/3600:.2f} hours)")
+    
+    if hasattr(train_dataset, 'close'):
+        train_dataset.close()
+    writer.close()
+
 
 if __name__ == "__main__":
-    writer = SummaryWriter()
-    writer = SummaryWriter(CONFIG.name) 
-    writer = SummaryWriter(comment=f"{CONFIG.name} Larger Slower Lower Batch Size test7.py {time.time() - 1744475000}") 
-    
+    log_dir_base = "runs"
+    current_time_str = time.strftime("%Y%m%d-%H%M%S")
+    log_dir = Path(log_dir_base) / f"{CONFIG.name}_{current_time_str}"
+    writer = SummaryWriter(log_dir=str(log_dir))
+    print(f"TensorBoard logs will be written to: {log_dir}")
+
     train_file = Path(CONFIG.train_data_file)
-    if not train_file.exists(): print(f"{train_file} not found. Dummy file will be created by dataset loader.")
+    if not train_file.exists() or train_file.stat().st_size == 0:
+        print(f"Training file '{train_file}' not found or empty. Attempting to create a dummy file.")
     validation_file = Path(CONFIG.validation_data_file)
-    if not validation_file.exists():
-        print(f"Creating dummy validation file: {validation_file}")
-        dummy_val_text = ("Validation sentence one.\nHas newline.\n" * 5)
-        try: validation_file.write_bytes(dummy_val_text.encode('utf-8', errors='replace'))
-        except Exception as e: print(f"Error creating dummy validation file: {e}")
+    if not validation_file.exists() or validation_file.stat().st_size == 0:
+        print(f"Validation file '{validation_file}' not found or empty. Attempting to create a dummy file.")
+        try:
+            val_dummy_text = ("Validation sentence one.\nHas newline.\n" * (CONFIG.max_length // 10))
+            if validation_file.parent: 
+                validation_file.parent.mkdir(parents=True, exist_ok=True)
+            validation_file.write_bytes(val_dummy_text.encode('utf-8', errors='replace') * 5)
+            print(f"Dummy validation file created: '{validation_file}'")
+        except Exception as e:
+            print(f"Error creating dummy validation file '{validation_file}': {e}")
 
     main()
