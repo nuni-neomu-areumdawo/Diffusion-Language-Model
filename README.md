@@ -105,7 +105,7 @@ Currently, inference is primarily demonstrated within the validation loop of the
 *   **Hyperparameter Optimization:** Conduct systematic hyperparameter tuning.
 *   **Extensive Evaluation:** Implement more evaluation metrics beside validation loss. 
 *   **Standalone Inference Script:** Create a dedicated script for inference with a trained model. 75%
-*   **Dataset Handling:** More robust dataset handling, potentially streaming for very large datasets. 100% ✅
+*   **Dataset Handling:** More robust dataset handling, streaming for very large datasets. 100% ✅
 *   **Detailed Profiling:** Profile different components (attention, FFN, data loading) to identify bottlenecks.
 
 ## Acknowledgements & References
